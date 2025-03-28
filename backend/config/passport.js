@@ -1,36 +1,32 @@
 import passport from "passport";
 import { Strategy as GoogleStrategy } from "passport-google-oauth20";
 import User from "../models/user.model.js";
-import redis from "redis";
+import { createClient } from 'redis';
 import dotenv from "dotenv";
 
 dotenv.config();
 
-// Create Redis client with retry strategy
-const client = redis.createClient({
-  url: `rediss://default:${process.env.UPSTASH_REDIS_PASSWORD}@${process.env.UPSTASH_REDIS_ENDPOINT}:${process.env.UPSTASH_REDIS_PORT}`,
-  retry_strategy: (options) => {
-    if (options.error && options.error.code === "ECONNRESET") {
-      console.error("Redis connection lost, reconnecting...");
-      return 3000; // Retry after 3 seconds
-    }
-    if (options.total_retry_time > 1000 * 60 * 60) {
-      return new Error("Retry time exhausted");
-    }
-    if (options.attempt > 10) {
-      return new Error("Max retries reached");
-    }
-    return Math.min(options.attempt * 100, 3000); // Retry with exponential backoff
-  },
+// Redis Client Setup (modern syntax)
+const redisClient = createClient({
+  url: `redis://${process.env.UPSTASH_REDIS_USER}:${process.env.UPSTASH_REDIS_PASSWORD}@${process.env.UPSTASH_REDIS_ENDPOINT}:${process.env.UPSTASH_REDIS_PORT}`,
+  socket: {
+    reconnectStrategy: (attempts) => Math.min(attempts * 100, 5000),
+    tls: process.env.NODE_ENV === 'production' // Enable TLS only in production
+  }
 });
 
-// Handle Redis connection errors
-client.on("error", (err) => {
-  console.error("Redis error:", err);
-});
+// Redis Error Handling
+redisClient.on('error', (err) => console.error('Redis Client Error:', err));
+redisClient.on('connect', () => console.log('Redis connected'));
+redisClient.on('reconnecting', () => console.log('Redis reconnecting'));
 
-// Connect to Redis
-client.connect();
+(async () => {
+  try {
+    await redisClient.connect();
+  } catch (err) {
+    console.error('Redis connection failed:', err);
+  }
+})();
 
 // Google OAuth Strategy
 passport.use(
@@ -38,61 +34,81 @@ passport.use(
     {
       clientID: process.env.GOOGLE_CLIENT_ID,
       clientSecret: process.env.GOOGLE_CLIENT_SECRET,
-      callbackURL: "http://localhost:9000/api/users/auth/google/callback",
+      callbackURL: process.env.GOOGLE_CALLBACK_URL || "http://localhost:9000/api/users/auth/google/callback",
       scope: ["profile", "email"],
+      passReqToCallback: true // Optional: gives access to req object
     },
-    async (accessToken, refreshToken, profile, done) => {
+    async (req, accessToken, refreshToken, profile, done) => {
       try {
-        // Check if the user already exists in the database by googleId or email
-        const user = await User.findOne({
-          $or: [{ googleId: profile.id }, { email: profile.emails[0].value }],
-        });
-
-        if (user) {
-          // If the user exists but doesn't have a googleId, update their record
-          if (!user.googleId) {
-            user.googleId = profile.id;
-            await user.save();
-          }
-          return done(null, user);
+        // Validate profile email exists
+        const email = profile.emails?.[0]?.value;
+        if (!email) {
+          return done(new Error("No email found in Google profile"));
         }
 
-        // User doesn't exist, create a new user
+        // Check for existing user
+        const existingUser = await User.findOne({
+          $or: [
+            { googleId: profile.id },
+            { email: email }
+          ]
+        });
+
+       
+        if (existingUser) {
+          // Merge accounts if user signed up with email first
+          if (!existingUser.googleId) {
+            existingUser.googleId = profile.id;
+            await existingUser.save();
+          }
+          return done(null, existingUser);
+        }
+
+       
         const newUser = await User.create({
           googleId: profile.id,
           name: profile.displayName,
-          email: profile.emails[0].value,
+          email: email,
+          authMethod: 'google' // Track auth method
         });
 
-        done(null, newUser);
+        return done(null, newUser);
       } catch (error) {
-        done(error);
+        console.error('Google OAuth Error:', error);
+        return done(error);
       }
     }
   )
 );
 
-// Serialize and deserialize user
+// Serialize/Deserialize with Redis caching
 passport.serializeUser((user, done) => {
-  done(null, user._id);
+  done(null, user._id.toString()); // Ensure ID is string
 });
 
 passport.deserializeUser(async (id, done) => {
+  const cacheKey = `user:${id}`;
+  
   try {
-    const data = await client.get(id);
-
-    if (data) {
-      const user = JSON.parse(data);
-      done(null, user);
-    } else {
-      const user = await User.findById(id);
-      if (!user) return done(null, false);
-
-      await client.setEx(id, 3600, JSON.stringify(user)); // Cache for 1 hour
-      done(null, user);
+    // Try cache first
+    const cachedUser = await redisClient.get(cacheKey);
+    if (cachedUser) {
+      return done(null, JSON.parse(cachedUser));
     }
+
+    // Fallback to database
+    const user = await User.findById(id);
+    if (!user) {
+      return done(new Error("User not found"));
+    }
+
+    // Cache user for 1 hour
+    await redisClient.setEx(cacheKey, 3600, JSON.stringify(user.toObject()));
+    return done(null, user);
+    
   } catch (error) {
-    done(error, null);
+    console.error('Deserialization Error:', error);
+    return done(error);
   }
 });
 
